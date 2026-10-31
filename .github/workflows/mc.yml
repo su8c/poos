@@ -1,11 +1,11 @@
 name: Set up Horizon (Minecraft 26.3 in Rust)
 
 # Put this file at .github/workflows/horizon-setup.yml
-# Horizon contains no game files, so this job rebuilds the "played once from the
-# official launcher" state itself: it downloads the Minecraft 26.3 client jar,
-# libraries, assets and server jar from Mojang's public endpoints, then runs
-# horizon-prepare. The prepared output is derived from the game, so it is
-# deliberately NOT uploaded as an artifact or cached publicly.
+# Runs on Linux and Windows runners (matrix). Horizon contains no game files, so
+# each job rebuilds the "played once from the official launcher" state itself:
+# it downloads the Minecraft 26.3 client jar, libraries, assets and server jar
+# from Mojang's public endpoints, then runs horizon-prepare. The prepared output
+# is derived from the game, so it is deliberately NOT uploaded or cached publicly.
 
 on:
   workflow_dispatch:
@@ -14,8 +14,8 @@ on:
         description: Minecraft version Horizon targets
         default: "26.3"
       asset_pattern:
-        description: Glob for the Horizon Linux release archive
-        default: "*linux*x86*64*"
+        description: Override the glob for the Horizon release archive (empty = per-OS default)
+        default: ""
       with_sounds:
         description: Also prepare sounds
         type: boolean
@@ -30,10 +30,31 @@ permissions:
 
 jobs:
   horizon:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    name: Horizon on ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            runner: ubuntu-latest
+            mc_os: linux
+            exe: ""
+            pattern: "*linux*x86*64*"
+          - name: Windows
+            runner: windows-latest
+            mc_os: windows
+            exe: ".exe"
+            pattern: "*windows*"
+    defaults:
+      run:
+        shell: bash
     env:
       MC_VERSION: ${{ inputs.mc_version || '26.3' }}
+      MC_OS: ${{ matrix.mc_os }}
+      EXE: ${{ matrix.exe }}
+      ASSET_PATTERN: ${{ inputs.asset_pattern || matrix.pattern }}
       MC_DIR: ${{ github.workspace }}/mc-home/.minecraft
       HORIZON_MINECRAFT_DIR: ${{ github.workspace }}/mc-home/.minecraft
       HORIZON_DIR: ${{ github.workspace }}/horizon
@@ -46,7 +67,12 @@ jobs:
           distribution: temurin
           java-version: "25"
 
-      - name: Install runtime libraries
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime libraries (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libasound2t64 libudev1 || \
@@ -59,35 +85,40 @@ jobs:
           TAG=$(gh release list --repo horizon-rust/horizon --exclude-drafts --exclude-pre-releases \
                   --limit 50 --json tagName --jq '.[].tagName' | grep -v '^launcher-v' | head -n1)
           echo "Horizon release: $TAG"
-          gh release download "$TAG" --repo horizon-rust/horizon \
-            --pattern "${{ inputs.asset_pattern || '*linux*x86*64*' }}" --dir dl
+          gh release download "$TAG" --repo horizon-rust/horizon --pattern "$ASSET_PATTERN" --dir dl
           ls -la dl
-          cd dl
-          for f in *; do
-            case "$f" in
-              *.tar.gz|*.tgz) tar -xzf "$f" -C "$HORIZON_DIR" ;;
-              *.zip)          unzip -q "$f" -d "$HORIZON_DIR" ;;
-              *.sha256|*.sig) ;;
-              *)              cp "$f" "$HORIZON_DIR/" ;;
-            esac
-          done
-          # Some archives nest everything in one folder: flatten if so.
-          if [ ! -e "$HORIZON_DIR/horizon-prepare" ]; then
-            INNER=$(dirname "$(find "$HORIZON_DIR" -name horizon-prepare -type f | head -n1)")
-            [ -n "$INNER" ] && cp -a "$INNER"/. "$HORIZON_DIR"/
-          fi
-          chmod +x "$HORIZON_DIR"/horizon-* || true
+          python - <<'PY'
+          import os, shutil, glob
+          dest = os.environ["HORIZON_DIR"]
+          for f in glob.glob("dl/*"):
+              if f.endswith((".sha256", ".sig", ".asc")):
+                  continue
+              try:
+                  shutil.unpack_archive(f, dest)
+              except shutil.ReadError:
+                  shutil.copy(f, dest)
+          # Flatten if everything is nested in one folder.
+          exe = ".exe" if os.name == "nt" else ""
+          if not os.path.exists(os.path.join(dest, "horizon-prepare" + exe)):
+              for root, _, files in os.walk(dest):
+                  if "horizon-prepare" + exe in files:
+                      for name in os.listdir(root):
+                          shutil.move(os.path.join(root, name), os.path.join(dest, name))
+                      break
+          PY
+          chmod +x "$HORIZON_DIR"/horizon-* 2>/dev/null || true
           ls -la "$HORIZON_DIR"
 
       - name: Fetch Minecraft files from Mojang
         run: |
           set -euo pipefail
           cat > fetch_mc.py <<'PY'
-          import hashlib, json, os, sys, urllib.request
+          import hashlib, json, os, urllib.request
           from concurrent.futures import ThreadPoolExecutor
 
           VER = os.environ["MC_VERSION"]
           MC = os.environ["MC_DIR"]
+          MC_OS = os.environ["MC_OS"]
           MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 
           def get(url):
@@ -114,8 +145,10 @@ jobs:
               for r in rules:
                   if "features" in r:
                       continue
-                  os_name = r.get("os", {}).get("name")
-                  if os_name in (None, "linux"):
+                  os_rule = r.get("os", {})
+                  if os_rule.get("name") in (None, MC_OS) and "arch" not in os_rule:
+                      ok = r["action"] == "allow"
+                  elif os_rule.get("name") == MC_OS and os_rule.get("arch") in ("x86_64", "amd64", "x64"):
                       ok = r["action"] == "allow"
               return ok
 
@@ -158,7 +191,7 @@ jobs:
               list(ex.map(lambda j: fetch(*j), jobs))
           print("Done.")
           PY
-          python3 fetch_mc.py
+          python fetch_mc.py
           ls "$MC_DIR" "$MC_DIR/versions/$MC_VERSION"
 
       - name: Prepare Horizon
@@ -166,18 +199,18 @@ jobs:
         run: |
           set -euo pipefail
           java -version
-          ./horizon-prepare --prepare --server-jar "$GITHUB_WORKSPACE/server.jar" --minecraft-dir "$MC_DIR"
+          ./horizon-prepare$EXE --prepare --server-jar "$GITHUB_WORKSPACE/server.jar" --minecraft-dir "$MC_DIR"
 
       - name: Prepare sounds (optional)
         if: ${{ inputs.with_sounds != false }}
         working-directory: horizon
-        run: ./horizon-prepare sounds --minecraft-dir "$MC_DIR"
+        run: ./horizon-prepare$EXE sounds --minecraft-dir "$MC_DIR"
 
       - name: Sanity check
         working-directory: horizon
         run: |
-          ./horizon-client --help | head -n 20
-          ./horizon-ctl help | head -n 20
+          ./horizon-client$EXE --help | head -n 20
+          ./horizon-ctl$EXE help | head -n 20
           ls -la
 
       - name: Run a Horizon server (optional)
@@ -185,9 +218,9 @@ jobs:
         working-directory: horizon
         run: |
           set -euo pipefail
-          ./horizon-server --dir my-server init
-          ./horizon-server --dir my-server start
+          ./horizon-server$EXE --dir my-server init
+          ./horizon-server$EXE --dir my-server start
           sleep 30
-          ./horizon-server --dir my-server status
-          ./horizon-server --dir my-server cmd list
-          ./horizon-server --dir my-server stop
+          ./horizon-server$EXE --dir my-server status
+          ./horizon-server$EXE --dir my-server cmd list
+          ./horizon-server$EXE --dir my-server stop

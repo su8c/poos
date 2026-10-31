@@ -78,6 +78,7 @@ jobs:
       HORIZON_MINECRAFT_DIR: ${{ github.workspace }}/mc-home/.minecraft
       HORIZON_DIR: ${{ github.workspace }}/horizon
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}   # no checkout step, so tell gh which repo to use
 
     steps:
       - name: Install Java 25

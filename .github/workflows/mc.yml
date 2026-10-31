@@ -226,6 +226,24 @@ jobs:
         with:
           name: my-artifact-name        # Optional: Defaults to 'artifact'
           path: .  
+      - name: Publish to GitHub Release
+        if: ${{ inputs.publish != false }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          [ -n "$TAG" ] || TAG="horizon-${MC_VERSION}-run${{ github.run_number }}"
+          DRAFT_FLAG=""
+          [ "${{ inputs.draft }}" != "false" ] && DRAFT_FLAG="--draft"
+ 
+          # Both matrix jobs target the same release: whoever gets there first creates it.
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" $DRAFT_FLAG \
+              --title "Horizon $MC_VERSION prepared build ($TAG)" \
+              --notes "Horizon prepared for Minecraft Java $MC_VERSION by CI. Derived from Mojang's game files: do not redistribute." \
+              --target "${{ github.sha }}" || sleep 5
+ 
+          gh release upload "$TAG" "$ASSET_BASE".* --clobber
+          echo "Release: $TAG"
 
       - name: Run a Horizon server (optional)
         if: ${{ inputs.run_server }}

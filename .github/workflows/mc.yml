@@ -24,9 +24,28 @@ on:
         description: Init + start a Horizon server and print its status
         type: boolean
         default: false
+      publish:
+        description: Package the prepared Horizon folder and attach it to a GitHub Release
+        type: boolean
+        default: true
+      release_tag:
+        description: Release tag (empty = horizon-<mc version>-run<run number>)
+        default: ""
+      draft:
+        description: Create the release as a draft (recommended, see note on redistribution)
+        type: boolean
+        default: true
+
+# NOTE: the prepared output is derived from Mojang's game files. Only publish it
+# in a PRIVATE repo (or keep it as a draft). Publishing it from a public repo
+# redistributes Minecraft content, which Horizon's own docs say not to do.
+
+concurrency:
+  group: horizon-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write   # needed to create releases and upload assets
 
 jobs:
   horizon:
@@ -118,6 +137,12 @@ jobs:
             exit 1
           fi
 
+      - name: Cache Mojang downloads
+        uses: actions/cache@v4
+        with:
+          path: mc-home/.minecraft
+          key: mc-${{ env.MC_VERSION }}-${{ matrix.mc_os }}-v1
+
       - name: Fetch Minecraft files from Mojang
         run: |
           set -euo pipefail
@@ -208,6 +233,8 @@ jobs:
         run: |
           set -euo pipefail
           java -version
+          ./horizon-prepare$EXE --help || true
+          touch "$GITHUB_WORKSPACE/prep.marker"; sleep 2
           ./horizon-prepare$EXE --prepare --server-jar "$GITHUB_WORKSPACE/server.jar" --minecraft-dir "$MC_DIR"
 
       - name: Prepare sounds (optional)
@@ -221,29 +248,6 @@ jobs:
           ./horizon-client$EXE --help | head -n 20
           ./horizon-ctl$EXE help | head -n 20
           ls -la
-      - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: my-artifact-name        # Optional: Defaults to 'artifact'
-          path: .  
-      - name: Publish to GitHub Release
-        if: ${{ inputs.publish != false }}
-        run: |
-          set -euo pipefail
-          TAG="${{ inputs.release_tag }}"
-          [ -n "$TAG" ] || TAG="horizon-${MC_VERSION}-run${{ github.run_number }}"
-          DRAFT_FLAG=""
-          [ "${{ inputs.draft }}" != "false" ] && DRAFT_FLAG="--draft"
- 
-          # Both matrix jobs target the same release: whoever gets there first creates it.
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" $DRAFT_FLAG \
-              --title "Horizon $MC_VERSION prepared build ($TAG)" \
-              --notes "Horizon prepared for Minecraft Java $MC_VERSION by CI. Derived from Mojang's game files: do not redistribute." \
-              --target "${{ github.sha }}" || sleep 5
- 
-          gh release upload "$TAG" "$ASSET_BASE".* --clobber
-          echo "Release: $TAG"
 
       - name: Run a Horizon server (optional)
         if: ${{ inputs.run_server }}
@@ -256,3 +260,83 @@ jobs:
           ./horizon-server$EXE --dir my-server status
           ./horizon-server$EXE --dir my-server cmd list
           ./horizon-server$EXE --dir my-server stop
+
+      - name: Package prepared Horizon
+        if: ${{ inputs.publish != false }}
+        run: |
+          set -euo pipefail
+          mkdir -p stage/horizon-prepared
+          cp -a "$HORIZON_DIR"/. stage/horizon-prepared/
+
+          # Find everything horizon-prepare wrote anywhere (files newer than the
+          # marker whose path mentions "horizon") and put it in the bundle under
+          # .local/horizon-client/..., the layout the client reads from.
+          python - <<'PY'
+          import os, shutil, sys
+          marker = os.path.getmtime(os.path.join(os.environ["GITHUB_WORKSPACE"], "prep.marker"))
+          stage = os.path.join("stage", "horizon-prepared")
+          roots = [os.environ.get(k) for k in ("HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA")]
+          roots = [r for r in dict.fromkeys(roots) if r and os.path.isdir(r)]
+          skip = (os.path.normpath(os.environ["MC_DIR"]).lower(), os.path.normpath(os.environ["HORIZON_DIR"]).lower())
+          copied, origins = 0, set()
+          for root in roots:
+              for dp, dn, fn in os.walk(root):
+                  low = os.path.normpath(dp).lower()
+                  if low.startswith(skip) or "hostedtoolcache" in low or "\\temp" in low or "/tmp" in low:
+                      dn[:] = []
+                      continue
+                  parts = os.path.normpath(dp).split(os.sep)
+                  if "horizon-client" not in parts:
+                      continue
+                  i = parts.index("horizon-client")
+                  for f in fn:
+                      src = os.path.join(dp, f)
+                      if os.path.getmtime(src) < marker:
+                          continue
+                      rel = os.path.join(*parts[i:], f)
+                      dst = os.path.join(stage, ".local", rel)
+                      os.makedirs(os.path.dirname(dst), exist_ok=True)
+                      shutil.copy2(src, dst)
+                      copied += 1
+                      origins.add(os.sep.join(parts[: i + 1]))
+          local = os.path.join(os.environ["HORIZON_DIR"], ".local")
+          inplace = sum(len(f) for _, _, f in os.walk(local)) if os.path.isdir(local) else 0
+          print(f"prepared files copied from outside the Horizon folder: {copied} (from {sorted(origins)})")
+          print(f"prepared files already inside the Horizon folder (.local): {inplace}")
+          if copied + inplace < 50:
+              print("::error::horizon-prepare output not found - refusing to publish a bundle that would crash on start")
+              sys.exit(1)
+          with open(os.path.join(stage, "INSTALL.txt"), "w") as f:
+              f.write("Unzip anywhere and run horizon-client. Prepared resources are in .local/horizon-client/%s.\n"
+                      "If the client cannot find them, pass --resources <this folder>/.local/horizon-client/%s\n"
+                      % (os.environ["MC_VERSION"], os.environ["MC_VERSION"]))
+          PY
+
+          NAME="horizon-prepared-${MC_VERSION}-${MC_OS}"
+          python - <<PY
+          import os, shutil
+          fmt = "zip" if os.environ["MC_OS"] == "windows" else "gztar"
+          print(shutil.make_archive("$NAME", fmt, "stage", "horizon-prepared"))
+          PY
+          ls -la "$NAME".*
+          sha256sum "$NAME".* > "$NAME.sha256"
+          echo "ASSET_BASE=$NAME" >> "$GITHUB_ENV"
+
+      - name: Publish to GitHub Release
+        if: ${{ inputs.publish != false }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          [ -n "$TAG" ] || TAG="horizon-${MC_VERSION}-run${{ github.run_number }}"
+          DRAFT_FLAG=""
+          [ "${{ inputs.draft }}" != "false" ] && DRAFT_FLAG="--draft"
+
+          # Both matrix jobs target the same release: whoever gets there first creates it.
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" $DRAFT_FLAG \
+              --title "Horizon $MC_VERSION prepared build ($TAG)" \
+              --notes "Horizon prepared for Minecraft Java $MC_VERSION by CI. Derived from Mojang's game files: do not redistribute." \
+              --target "${{ github.sha }}" || sleep 5
+
+          gh release upload "$TAG" "$ASSET_BASE".* --clobber
+          echo "Release: $TAG"

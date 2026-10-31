@@ -83,7 +83,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$HORIZON_DIR" dl
           TAG=$(gh release list --repo horizon-rust/horizon --exclude-drafts --exclude-pre-releases \
-                  --limit 50 --json tagName --jq '.[].tagName' | grep -v '^launcher-v' | head -n1)
+                  --limit 50 --json tagName --jq '.[].tagName' | grep -vi 'launcher' | head -n1)
           echo "Horizon release: $TAG"
           gh release download "$TAG" --repo horizon-rust/horizon --pattern "$ASSET_PATTERN" --dir dl
           ls -la dl
@@ -107,7 +107,16 @@ jobs:
                       break
           PY
           chmod +x "$HORIZON_DIR"/horizon-* 2>/dev/null || true
-          ls -la "$HORIZON_DIR"
+          echo "--- all assets in $TAG ---"
+          gh release view "$TAG" --repo horizon-rust/horizon --json assets --jq '.assets[].name'
+          echo "--- downloaded ---"
+          ls -la dl
+          echo "--- extracted tree ---"
+          find "$HORIZON_DIR" -maxdepth 3 | head -n 80
+          if [ -z "$(find "$HORIZON_DIR" -name "horizon-prepare*" -type f | head -n1)" ]; then
+            echo "::error::No horizon-prepare in the downloaded archive(s). Set the asset_pattern input to the right file (see the asset list above)."
+            exit 1
+          fi
 
       - name: Fetch Minecraft files from Mojang
         run: |

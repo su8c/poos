@@ -1,0 +1,193 @@
+name: Set up Horizon (Minecraft 26.3 in Rust)
+
+# Put this file at .github/workflows/horizon-setup.yml
+# Horizon contains no game files, so this job rebuilds the "played once from the
+# official launcher" state itself: it downloads the Minecraft 26.3 client jar,
+# libraries, assets and server jar from Mojang's public endpoints, then runs
+# horizon-prepare. The prepared output is derived from the game, so it is
+# deliberately NOT uploaded as an artifact or cached publicly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mc_version:
+        description: Minecraft version Horizon targets
+        default: "26.3"
+      asset_pattern:
+        description: Glob for the Horizon Linux release archive
+        default: "*linux*x86*64*"
+      with_sounds:
+        description: Also prepare sounds
+        type: boolean
+        default: true
+      run_server:
+        description: Init + start a Horizon server and print its status
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  horizon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      MC_VERSION: ${{ inputs.mc_version || '26.3' }}
+      MC_DIR: ${{ github.workspace }}/mc-home/.minecraft
+      HORIZON_MINECRAFT_DIR: ${{ github.workspace }}/mc-home/.minecraft
+      HORIZON_DIR: ${{ github.workspace }}/horizon
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Install Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Install runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2t64 libudev1 || \
+          sudo apt-get install -y --no-install-recommends libasound2 libudev1
+
+      - name: Download Horizon (latest non-launcher release)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HORIZON_DIR" dl
+          TAG=$(gh release list --repo horizon-rust/horizon --exclude-drafts --exclude-pre-releases \
+                  --limit 50 --json tagName --jq '.[].tagName' | grep -v '^launcher-v' | head -n1)
+          echo "Horizon release: $TAG"
+          gh release download "$TAG" --repo horizon-rust/horizon \
+            --pattern "${{ inputs.asset_pattern || '*linux*x86*64*' }}" --dir dl
+          ls -la dl
+          cd dl
+          for f in *; do
+            case "$f" in
+              *.tar.gz|*.tgz) tar -xzf "$f" -C "$HORIZON_DIR" ;;
+              *.zip)          unzip -q "$f" -d "$HORIZON_DIR" ;;
+              *.sha256|*.sig) ;;
+              *)              cp "$f" "$HORIZON_DIR/" ;;
+            esac
+          done
+          # Some archives nest everything in one folder: flatten if so.
+          if [ ! -e "$HORIZON_DIR/horizon-prepare" ]; then
+            INNER=$(dirname "$(find "$HORIZON_DIR" -name horizon-prepare -type f | head -n1)")
+            [ -n "$INNER" ] && cp -a "$INNER"/. "$HORIZON_DIR"/
+          fi
+          chmod +x "$HORIZON_DIR"/horizon-* || true
+          ls -la "$HORIZON_DIR"
+
+      - name: Fetch Minecraft files from Mojang
+        run: |
+          set -euo pipefail
+          cat > fetch_mc.py <<'PY'
+          import hashlib, json, os, sys, urllib.request
+          from concurrent.futures import ThreadPoolExecutor
+
+          VER = os.environ["MC_VERSION"]
+          MC = os.environ["MC_DIR"]
+          MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "horizon-ci"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return r.read()
+
+          def fetch(url, dest, sha1=None):
+              if os.path.exists(dest) and (not sha1 or hashlib.sha1(open(dest, "rb").read()).hexdigest() == sha1):
+                  return
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              for attempt in range(4):
+                  data = get(url)
+                  if not sha1 or hashlib.sha1(data).hexdigest() == sha1:
+                      with open(dest, "wb") as f:
+                          f.write(data)
+                      return
+              raise SystemExit(f"checksum mismatch: {url}")
+
+          def allowed(rules):
+              if not rules:
+                  return True
+              ok = False
+              for r in rules:
+                  if "features" in r:
+                      continue
+                  os_name = r.get("os", {}).get("name")
+                  if os_name in (None, "linux"):
+                      ok = r["action"] == "allow"
+              return ok
+
+          manifest = json.loads(get(MANIFEST))
+          entry = next((v for v in manifest["versions"] if v["id"] == VER), None)
+          if not entry:
+              raise SystemExit(f"Version {VER} not found in Mojang manifest")
+          vjson_bytes = get(entry["url"])
+          vjson = json.loads(vjson_bytes)
+
+          vdir = os.path.join(MC, "versions", VER)
+          os.makedirs(vdir, exist_ok=True)
+          with open(os.path.join(vdir, f"{VER}.json"), "wb") as f:
+              f.write(vjson_bytes)
+
+          client = vjson["downloads"]["client"]
+          fetch(client["url"], os.path.join(vdir, f"{VER}.jar"), client["sha1"])
+
+          server = vjson["downloads"]["server"]
+          fetch(server["url"], os.path.join(os.environ["GITHUB_WORKSPACE"], "server.jar"), server["sha1"])
+
+          jobs = []
+          for lib in vjson.get("libraries", []):
+              if not allowed(lib.get("rules")):
+                  continue
+              art = lib.get("downloads", {}).get("artifact")
+              if art:
+                  jobs.append((art["url"], os.path.join(MC, "libraries", art["path"]), art["sha1"]))
+
+          ai = vjson["assetIndex"]
+          idx_path = os.path.join(MC, "assets", "indexes", ai["id"] + ".json")
+          fetch(ai["url"], idx_path, ai["sha1"])
+          for obj in json.load(open(idx_path))["objects"].values():
+              h = obj["hash"]
+              jobs.append((f"https://resources.download.minecraft.net/{h[:2]}/{h}",
+                           os.path.join(MC, "assets", "objects", h[:2], h), h))
+
+          print(f"Downloading {len(jobs)} files...", flush=True)
+          with ThreadPoolExecutor(32) as ex:
+              list(ex.map(lambda j: fetch(*j), jobs))
+          print("Done.")
+          PY
+          python3 fetch_mc.py
+          ls "$MC_DIR" "$MC_DIR/versions/$MC_VERSION"
+
+      - name: Prepare Horizon
+        working-directory: horizon
+        run: |
+          set -euo pipefail
+          java -version
+          ./horizon-prepare --prepare --server-jar "$GITHUB_WORKSPACE/server.jar" --minecraft-dir "$MC_DIR"
+
+      - name: Prepare sounds (optional)
+        if: ${{ inputs.with_sounds != false }}
+        working-directory: horizon
+        run: ./horizon-prepare sounds --minecraft-dir "$MC_DIR"
+
+      - name: Sanity check
+        working-directory: horizon
+        run: |
+          ./horizon-client --help | head -n 20
+          ./horizon-ctl help | head -n 20
+          ls -la
+
+      - name: Run a Horizon server (optional)
+        if: ${{ inputs.run_server }}
+        working-directory: horizon
+        run: |
+          set -euo pipefail
+          ./horizon-server --dir my-server init
+          ./horizon-server --dir my-server start
+          sleep 30
+          ./horizon-server --dir my-server status
+          ./horizon-server --dir my-server cmd list
+          ./horizon-server --dir my-server stop
